@@ -1,6 +1,20 @@
 import os
 import sys
 
+"""
+GPT-SoVITS 的主 WebUI 入口。
+
+这个文件同时承担了几类职责：
+1. 启动阶段环境初始化：设置运行目录、环境变量、临时目录、site-packages 搜索路径等。
+2. 作为“调度器”管理多个外部脚本：ASR、切分、降噪、数据集预处理、训练、推理 WebUI 等。
+3. 维护 Gradio 界面：定义控件、绑定事件，并把按钮动作映射到具体函数。
+
+整体设计特点：
+- 真正耗时的逻辑大多不直接写在这里，而是通过 `subprocess.Popen` 拉起其它脚本。
+- 当前文件更偏向“控制台 + UI 编排层”，负责收集参数、设置环境、启动/停止任务、刷新界面状态。
+- 由于要兼顾 Windows / Linux / macOS，以及多个模型版本，因此这里会看到较多环境变量和版本分支。
+"""
+
 os.environ["version"] = version = "v2Pro"
 now_dir = os.getcwd()
 sys.path.insert(0, now_dir)
@@ -21,6 +35,8 @@ torch.manual_seed(233333)
 tmp = os.path.join(now_dir, "TEMP")
 os.makedirs(tmp, exist_ok=True)
 os.environ["TEMP"] = tmp
+# 启动时清理 TEMP 目录，避免上一次运行遗留的中间文件干扰当前流程。
+# `jieba.cache` 保留是因为它属于常见中文分词缓存，重复删建意义不大。
 if os.path.exists(tmp):
     for name in os.listdir(tmp):
         if name == "jieba.cache":
@@ -44,6 +60,8 @@ if site_packages_roots == []:
 # os.environ["OPENBLAS_NUM_THREADS"] = "4"
 os.environ["no_proxy"] = "localhost, 127.0.0.1, ::1"
 os.environ["all_proxy"] = ""
+# 通过写入 `users.pth`，把项目根目录及相关子目录注入 Python 搜索路径。
+# 这样后续子脚本被单独拉起时，也能直接 import 到仓库内模块，而不需要手动设置 PYTHONPATH。
 for site_packages_root in site_packages_roots:
     if os.path.exists(site_packages_root):
         try:
@@ -102,6 +120,15 @@ v3v4set = {"v3", "v4"}
 
 
 def set_default():
+    """根据当前硬件和模型版本，计算界面默认参数。
+
+    这里主要决定：
+    - 训练 batch size 的默认值和上限
+    - SoVITS 训练轮数 / 保存频率默认值
+    - 不同版本(v1/v2/v2Pro/v4 等)下的推荐配置
+
+    这些值既影响界面初始化，也会在切换模型版本时被重新刷新。
+    """
     global \
         default_batch_size, \
         default_max_batch_size, \
@@ -143,6 +170,13 @@ default_gpu_numbers = infer_device.index
 
 
 def fix_gpu_number(input):  # 将越界的number强制改到界内
+    """校正单个 GPU 编号。
+
+    用户在文本框里手填 GPU 编号时，可能出现越界、非法字符等情况。
+    这里尽量做兜底：
+    - 合法且在可用卡列表中：原样返回
+    - 非法或越界：回退到默认推理卡
+    """
     try:
         if int(input) not in set_gpu_numbers:
             return default_gpu_numbers
@@ -152,6 +186,10 @@ def fix_gpu_number(input):  # 将越界的number强制改到界内
 
 
 def fix_gpu_numbers(inputs):
+    """批量校正 GPU 编号字符串。
+
+    输入通常类似 `"0,1"`，逐个调用 `fix_gpu_number` 做清洗后再拼回去。
+    """
     output = []
     try:
         for input in inputs.split(","):
@@ -165,6 +203,11 @@ from config import pretrained_gpt_name, pretrained_sovits_name
 
 
 def check_pretrained_is_exist(version):
+    """检查当前版本依赖的预训练模型是否齐全。
+
+    缺失时这里只打印 warning，不直接终止进程。
+    这样 WebUI 仍能打开，用户可以在界面里自行改路径或补模型。
+    """
     pretrained_model_list = (
         pretrained_sovits_name[version],
         pretrained_sovits_name[version].replace("s2G", "s2D"),
@@ -209,6 +252,11 @@ p_tts_inference = None
 
 
 def kill_proc_tree(pid, including_parent=True):
+    """递归终止进程树。
+
+    非 Windows 平台下，很多任务会再拉起子进程；只杀父进程可能会留下孤儿进程。
+    因此这里先遍历并终止所有子进程，再按需终止父进程本身。
+    """
     try:
         parent = psutil.Process(pid)
     except psutil.NoSuchProcess:
@@ -232,6 +280,10 @@ system = platform.system()
 
 
 def kill_process(pid, process_name=""):
+    """按平台差异终止进程。
+
+    Windows 走 `taskkill /t /f`，其它系统走递归 kill。
+    """
     if system == "Windows":
         cmd = "taskkill /t /f /pid %s" % pid
         # os.system(cmd)
@@ -242,6 +294,10 @@ def kill_process(pid, process_name=""):
 
 
 def process_info(process_name="", indicator=""):
+    """统一生成界面上的状态提示文案。
+
+    WebUI 中很多按钮和状态框都依赖同一套措辞，集中在这里便于国际化和维护。
+    """
     if indicator == "opened":
         return process_name + i18n("已开启")
     elif indicator == "open":
@@ -268,6 +324,17 @@ process_name_subfix = i18n("音频标注WebUI")
 
 
 def change_label(path_list):
+    """打开/关闭标注校对子 WebUI。
+
+    这是一个“切换式”函数：
+    - 当前未启动：检查路径后拉起子 WebUI
+    - 当前已启动：终止对应进程
+
+    之所以使用 `yield`，是为了配合 Gradio 流式更新，一次点击就能同步更新：
+    1. 状态文本
+    2. 打开按钮可见性
+    3. 关闭按钮可见性
+    """
     global p_label
     if p_label is None:
         check_for_existance([path_list])
@@ -299,6 +366,7 @@ process_name_uvr5 = i18n("人声分离WebUI")
 
 
 def change_uvr5():
+    """打开/关闭 UVR5 人声分离子 WebUI。"""
     global p_uvr5
     if p_uvr5 is None:
         cmd = '"%s" -s tools/uvr5/webui.py "%s" %s %s %s' % (
@@ -329,6 +397,14 @@ process_name_tts = i18n("TTS推理WebUI")
 
 
 def change_tts_inference(bert_path, cnhubert_base_path, gpu_number, gpt_path, sovits_path, batched_infer_enabled):
+    """打开/关闭推理 WebUI。
+
+    这里并不直接执行推理，而是：
+    - 把当前界面中选择的模型路径、BERT/Hubert 路径、GPU 编号等参数
+      通过环境变量传给推理脚本
+    - 根据是否启用并行推理，选择启动 `inference_webui.py`
+      或 `inference_webui_fast.py`
+    """
     global p_tts_inference
     if batched_infer_enabled:
         cmd = '"%s" -s GPT_SoVITS/inference_webui_fast.py "%s"' % (python_exec, language)
@@ -369,6 +445,13 @@ process_name_asr = i18n("语音识别")
 
 
 def open_asr(asr_inp_dir, asr_opt_dir, asr_model, asr_model_size, asr_lang, asr_precision):
+    """执行语音识别任务，并把结果路径回填到界面。
+
+    ASR 完成后会把生成的 `.list` 文件路径自动写回：
+    - 标注文件输入框
+    - 训练集文本标注输入框
+    同时把音频目录也同步给后续流程，减少重复填写。
+    """
     global p_asr
     if p_asr is None:
         asr_inp_dir = my_utils.clean_path(asr_inp_dir)
@@ -415,6 +498,7 @@ def open_asr(asr_inp_dir, asr_opt_dir, asr_model, asr_model_size, asr_lang, asr_
 
 
 def close_asr():
+    """手动终止正在运行的 ASR 任务。"""
     global p_asr
     if p_asr is not None:
         kill_process(p_asr.pid, process_name_asr)
@@ -430,6 +514,10 @@ process_name_denoise = i18n("语音降噪")
 
 
 def open_denoise(denoise_inp_dir, denoise_opt_dir):
+    """执行降噪任务。
+
+    当前实现是同步等待子进程结束，结束后再把输出目录回填给后续步骤。
+    """
     global p_denoise
     if p_denoise == None:
         denoise_inp_dir = my_utils.clean_path(denoise_inp_dir)
@@ -471,6 +559,7 @@ def open_denoise(denoise_inp_dir, denoise_opt_dir):
 
 
 def close_denoise():
+    """终止降噪任务。"""
     global p_denoise
     if p_denoise is not None:
         kill_process(p_denoise.pid, process_name_denoise)
@@ -501,6 +590,15 @@ def open1Ba(
     if_grad_ckpt,
     lora_rank,
 ):
+    """启动 SoVITS 训练。
+
+    逻辑流程：
+    1. 根据版本选择基础配置模板(json)
+    2. 用界面参数覆盖模板中的训练项
+    3. 写入临时配置文件到 TEMP
+    4. 拉起对应训练脚本
+    5. 训练完成后刷新推理页的权重下拉框
+    """
     global p_train_SoVITS
     if p_train_SoVITS == None:
         exp_name = exp_name.rstrip(" ")
@@ -572,6 +670,7 @@ def open1Ba(
 
 
 def close1Ba():
+    """终止 SoVITS 训练进程。"""
     global p_train_SoVITS
     if p_train_SoVITS is not None:
         kill_process(p_train_SoVITS.pid, process_name_sovits)
@@ -598,6 +697,10 @@ def open1Bb(
     gpu_numbers,
     pretrained_s1,
 ):
+    """启动 GPT 训练。
+
+    与 `open1Ba` 类似，这里负责把界面参数写入 yaml 配置后调用 `s1_train.py`。
+    """
     global p_train_GPT
     if p_train_GPT == None:
         exp_name = exp_name.rstrip(" ")
@@ -664,6 +767,7 @@ def open1Bb(
 
 
 def close1Bb():
+    """终止 GPT 训练进程。"""
     global p_train_GPT
     if p_train_GPT is not None:
         kill_process(p_train_GPT.pid, process_name_gpt)
@@ -680,6 +784,14 @@ process_name_slice = i18n("语音切分")
 
 
 def open_slice(inp, opt_root, threshold, min_length, min_interval, hop_size, max_sil_kept, _max, alpha, n_parts):
+    """执行音频切分。
+
+    支持两种输入：
+    - 单个文件：强制只开 1 个切分进程
+    - 文件夹：可按 `n_parts` 并行切分
+
+    这里会同时拉起多个 `slice_audio.py` 子进程，每个进程处理一个分片编号。
+    """
     global ps_slice
     inp = my_utils.clean_path(inp)
     opt_root = my_utils.clean_path(opt_root)
@@ -758,6 +870,7 @@ def open_slice(inp, opt_root, threshold, min_length, min_interval, hop_size, max
 
 
 def close_slice():
+    """终止所有音频切分子进程。"""
     global ps_slice
     if ps_slice != []:
         for p_slice in ps_slice:
@@ -778,6 +891,13 @@ process_name_1a = i18n("文本分词与特征提取")
 
 
 def open1a(inp_text, inp_wav_dir, exp_name, gpu_numbers, bert_pretrained_dir):
+    """执行 1A：文本处理与特征提取。
+
+    核心思路：
+    - 按 GPU 数量把任务切成多个 part 并行执行
+    - 每个 part 输出一个中间文本文件
+    - 主进程等待全部完成后，把分片结果合并成最终的 `2-name2text.txt`
+    """
     global ps1a
     inp_text = my_utils.clean_path(inp_text)
     inp_wav_dir = my_utils.clean_path(inp_wav_dir)
@@ -847,6 +967,7 @@ def open1a(inp_text, inp_wav_dir, exp_name, gpu_numbers, bert_pretrained_dir):
 
 
 def close1a():
+    """终止 1A 的所有子进程。"""
     global ps1a
     if ps1a != []:
         for p1a in ps1a:
@@ -868,6 +989,10 @@ process_name_1b = i18n("语音自监督特征提取")
 
 
 def open1b(version, inp_text, inp_wav_dir, exp_name, gpu_numbers, ssl_pretrained_dir):
+    """执行 1B：提取 SSL / Hubert 特征。
+
+    对 Pro 版本，除了 Hubert 特征外，还会额外执行说话人向量(`2-get-sv.py`)提取。
+    """
     global ps1b
     inp_text = my_utils.clean_path(inp_text)
     inp_wav_dir = my_utils.clean_path(inp_wav_dir)
@@ -938,6 +1063,7 @@ def open1b(version, inp_text, inp_wav_dir, exp_name, gpu_numbers, ssl_pretrained
 
 
 def close1b():
+    """终止 1B 的所有子进程。"""
     global ps1b
     if ps1b != []:
         for p1b in ps1b:
@@ -958,6 +1084,11 @@ process_name_1c = i18n("语义Token提取")
 
 
 def open1c(version, inp_text, inp_wav_dir, exp_name, gpu_numbers, pretrained_s2G_path):
+    """执行 1C：语义 token 提取。
+
+    与 1A 类似，这里也采用“多 GPU 分片处理 + 合并结果文件”的模式，
+    最终产出 `6-name2semantic.tsv`。
+    """
     global ps1c
     inp_text = my_utils.clean_path(inp_text)
     if check_for_existance([inp_text, inp_wav_dir], is_dataset_processing=True):
@@ -1024,6 +1155,7 @@ def open1c(version, inp_text, inp_wav_dir, exp_name, gpu_numbers, pretrained_s2G
 
 
 def close1c():
+    """终止 1C 的所有子进程。"""
     global ps1c
     if ps1c != []:
         for p1c in ps1c:
@@ -1055,6 +1187,14 @@ def open1abc(
     ssl_pretrained_dir,
     pretrained_s2G_path,
 ):
+    """按 1A -> 1B -> 1C 顺序一键执行训练集预处理。
+
+    这个函数把原本分开的三个步骤串起来，并尽量复用已有结果：
+    - 如果 `2-name2text.txt` 已存在且内容足够，则跳过 1A
+    - 如果 `6-name2semantic.tsv` 已存在且大小合理，则跳过 1C
+
+    这样在某一步失败或中断后，重跑时不会重复消耗全部时间。
+    """
     global ps1abc
     inp_text = my_utils.clean_path(inp_text)
     inp_wav_dir = my_utils.clean_path(inp_wav_dir)
@@ -1246,6 +1386,7 @@ def open1abc(
 
 
 def close1abc():
+    """终止一键三连里所有仍在运行的子进程。"""
     global ps1abc
     if ps1abc != []:
         for p1abc in ps1abc:
@@ -1262,6 +1403,13 @@ def close1abc():
 
 
 def switch_version(version_):
+    """切换当前训练/推理所使用的模型版本。
+
+    切换版本后需要同步更新很多界面状态，例如：
+    - 默认预训练模型路径
+    - 默认 batch size / epoch / 保存频率
+    - 某些版本特有控件的显隐状态（如 LoRA、梯度检查点等）
+    """
     os.environ["version"] = version_
     global version
     version = version_
@@ -1299,10 +1447,18 @@ else:
 
 
 def sync(text):
+    """把一个输入框的值原样同步到另一个控件。
+
+    这里主要用于“预训练路径输入框”变更时，实时同步到其它相关控件。
+    """
     return {"__type__": "update", "value": text}
 
 
 with gr.Blocks(title="GPT-SoVITS WebUI", analytics_enabled=False, js=js, css=css) as app:
+    # 整个 WebUI 的结构大体分成三部分：
+    # 0. 前置数据处理工具：切分、ASR、标注等
+    # 1. GPT-SoVITS-TTS：数据集格式化、训练、推理
+    # 2. 变声：当前尚未完成
     gr.HTML(
         top_html.format(
             i18n("本软件以MIT协议开源, 作者不对软件具备任何控制力, 使用软件者、传播软件导出的声音者自负全责.")
@@ -1313,6 +1469,8 @@ with gr.Blocks(title="GPT-SoVITS WebUI", analytics_enabled=False, js=js, css=css
 
     with gr.Tabs():
         with gr.TabItem("0-" + i18n("前置数据集获取工具")):  # 提前随机切片防止uvr5爆内存->uvr5->slicer->asr->打标
+            # 推荐工作流通常是：
+            # 原始音频 -> 人声分离/去混响 -> 切分 -> ASR -> 文本校对标注
             with gr.Accordion(label="0a-" + i18n("UVR5人声伴奏分离&去混响去延迟工具")):
                 with gr.Row():
                     with gr.Column(scale=3):
@@ -1438,6 +1596,7 @@ with gr.Blocks(title="GPT-SoVITS WebUI", analytics_enabled=False, js=js, css=css
                     return {"__type__": "update", "choices": asr_dict[key]["size"], "value": asr_dict[key]["size"][-1]}
 
                 def change_precision_choices(key):  # 根据选择的模型修改可选的语言
+                    # 不同 ASR 后端支持的数据类型不同，这里按模型能力和显存情况给默认值。
                     if key == "Faster Whisper (多语种)":
                         if default_batch_size <= 4:
                             precision = "int8"
@@ -1476,6 +1635,8 @@ with gr.Blocks(title="GPT-SoVITS WebUI", analytics_enabled=False, js=js, css=css
                 close_uvr5.click(change_uvr5, [], [uvr5_info, open_uvr5, close_uvr5])
 
         with gr.TabItem(i18n("1-GPT-SoVITS-TTS")):
+            # 1 号主标签页是整个项目最核心的区域：
+            # 训练集准备 -> 微调训练 -> 推理，都在这里完成。
             with gr.Accordion(i18n("微调模型信息")):
                 with gr.Row():
                     with gr.Row(equal_height=True):
@@ -1527,6 +1688,7 @@ with gr.Blocks(title="GPT-SoVITS WebUI", analytics_enabled=False, js=js, css=css
                         )
 
             with gr.TabItem("1A-" + i18n("训练集格式化工具")):
+                # 1A 负责把原始标注 + 音频目录转换成训练脚本所需的标准中间产物。
                 with gr.Accordion(label=i18n("输出logs/实验名目录下应有23456开头的文件和文件夹")):
                     with gr.Row():
                         with gr.Row():
@@ -1702,6 +1864,10 @@ with gr.Blocks(title="GPT-SoVITS WebUI", analytics_enabled=False, js=js, css=css
             button1abc_close.click(close1abc, [], [info1abc, button1abc_open, button1abc_close])
 
             with gr.TabItem("1B-" + i18n("微调训练")):
+                # 1B 分为两部分：
+                # - 1Ba: 训练 SoVITS
+                # - 1Bb: 训练 GPT
+                # 两者共享实验名，但权重会分别输出到不同目录。
                 with gr.Accordion(label="1Ba-" + i18n("SoVITS 训练: 模型权重文件在 SoVITS_weights/")):
                     with gr.Row():
                         with gr.Column():
@@ -1852,6 +2018,7 @@ with gr.Blocks(title="GPT-SoVITS WebUI", analytics_enabled=False, js=js, css=css
             button1Bb_close.click(close1Bb, [], [info1Bb, button1Bb_open, button1Bb_close])
 
             with gr.TabItem("1C-" + i18n("推理")):
+                # 推理页不直接做 TTS 推理计算，而是再拉起一个专门的推理 WebUI。
                 gr.Markdown(
                     value=i18n(
                         "选择训练完存放在SoVITS_weights和GPT_weights下的模型。默认的几个是底模，体验5秒Zero Shot TTS不训练推理用。"
@@ -1973,6 +2140,7 @@ with gr.Blocks(title="GPT-SoVITS WebUI", analytics_enabled=False, js=js, css=css
             gr.Markdown(value=i18n("施工中，请静候佳音"))
 
     app.queue().launch(  # concurrency_count=511, max_size=1022
+        # `queue()` 允许 Gradio 以队列形式处理长任务，避免多个按钮操作互相阻塞导致前端卡死。
         server_name="0.0.0.0",
         inbrowser=True,
         share=is_share,

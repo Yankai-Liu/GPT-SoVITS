@@ -130,6 +130,7 @@ import threading
 i18n = I18nAuto()
 cut_method_names = get_cut_method_names()
 
+# 解析命令行参数，用于决定 API 服务监听地址、端口以及 TTS 推理配置文件。
 parser = argparse.ArgumentParser(description="GPT-SoVITS api")
 parser.add_argument("-c", "--tts_config", type=str, default="GPT_SoVITS/configs/tts_infer.yaml", help="tts_infer路径")
 parser.add_argument("-a", "--bind_addr", type=str, default="127.0.0.1", help="default: 127.0.0.1")
@@ -152,6 +153,8 @@ APP = FastAPI()
 
 
 class TTS_Request(BaseModel):
+    # FastAPI 会用这个 Pydantic 模型解析 POST /tts 的 JSON 请求体。
+    # 这里的字段与 tts_pipeline.run(req) 所需参数保持一致，便于直接转成 dict 传入。
     text: str = None
     text_lang: str = None
     ref_audio_path: str = None
@@ -179,6 +182,9 @@ class TTS_Request(BaseModel):
 
 
 def pack_ogg(io_buffer: BytesIO, data: np.ndarray, rate: int):
+    # 将 PCM 数据编码为 ogg 并写入内存缓冲区。
+    # 这里单独开线程不是为了并发性能，而是为了给 libsndfile 更大的线程栈空间，
+    # 规避大音频转 ogg 时可能出现的栈溢出问题。
     # Author: AkagawaTsurunaki
     # Issue:
     #   Stack overflow probabilistically occurs
@@ -196,6 +202,7 @@ def pack_ogg(io_buffer: BytesIO, data: np.ndarray, rate: int):
     #   Or split the whole audio data into smaller audio segment to avoid stack overflow?
 
     def handle_pack_ogg():
+        # soundfile 直接对 BytesIO 写入，避免在磁盘上生成临时文件。
         with sf.SoundFile(io_buffer, mode="w", samplerate=rate, channels=1, format="ogg") as audio_file:
             audio_file.write(data)
 
@@ -225,17 +232,22 @@ def pack_ogg(io_buffer: BytesIO, data: np.ndarray, rate: int):
 
 
 def pack_raw(io_buffer: BytesIO, data: np.ndarray, rate: int):
+    # raw 模式下不做任何封装，直接返回裸 PCM 字节流。
+    # 调用方需要自行知道采样率、位宽和声道数。
     io_buffer.write(data.tobytes())
     return io_buffer
 
 
 def pack_wav(io_buffer: BytesIO, data: np.ndarray, rate: int):
+    # wav 需要包含文件头，因此重新构造一个新的 BytesIO 来写入完整 wav 数据。
     io_buffer = BytesIO()
     sf.write(io_buffer, data, rate, format="wav")
     return io_buffer
 
 
 def pack_aac(io_buffer: BytesIO, data: np.ndarray, rate: int):
+    # 通过 ffmpeg 子进程把内存中的 PCM 数据转成 AAC。
+    # 这里使用管道输入输出，避免中间文件落盘。
     process = subprocess.Popen(
         [
             "ffmpeg",
@@ -266,6 +278,8 @@ def pack_aac(io_buffer: BytesIO, data: np.ndarray, rate: int):
 
 
 def pack_audio(io_buffer: BytesIO, data: np.ndarray, rate: int, media_type: str):
+    # 根据前端请求的媒体类型统一封装输出格式。
+    # 所有分支最终都返回一个 seek(0) 后的 BytesIO，便于后续直接读取内容。
     if media_type == "ogg":
         io_buffer = pack_ogg(io_buffer, data, rate)
     elif media_type == "aac":
@@ -280,6 +294,8 @@ def pack_audio(io_buffer: BytesIO, data: np.ndarray, rate: int, media_type: str)
 
 # from https://huggingface.co/spaces/coqui/voice-chat-with-mistral/blob/main/app.py
 def wave_header_chunk(frame_input=b"", channels=1, sample_width=2, sample_rate=32000):
+    # 流式返回 wav 时，只应该在第一个 chunk 前面补一次 wav header。
+    # 后续 chunk 只传裸 PCM 数据，否则每个片段都会被播放器误认为是新的 wav 文件。
     # This will create a wave header then append the frame input
     # It should be first on a streaming wav file
     # Other frames better should not have it (else you will hear some artifacts each chunk start)
@@ -295,6 +311,7 @@ def wave_header_chunk(frame_input=b"", channels=1, sample_width=2, sample_rate=3
 
 
 def handle_control(command: str):
+    # 提供一个简单的进程控制接口，方便通过 HTTP 重启或退出服务。
     if command == "restart":
         os.execl(sys.executable, sys.executable, *argv)
     elif command == "exit":
@@ -303,6 +320,8 @@ def handle_control(command: str):
 
 
 def check_params(req: dict):
+    # 对请求参数做统一校验，避免无效请求真正进入推理流程。
+    # 这里直接返回 JSONResponse，调用方可以原样返回给客户端。
     text: str = req.get("text", "")
     text_lang: str = req.get("text_lang", "")
     ref_audio_path: str = req.get("ref_audio_path", "")
@@ -381,10 +400,16 @@ async def tts_handle(req: dict):
     return_fragment = req.get("return_fragment", False)
     media_type = req.get("media_type", "wav")
 
+    # 先做参数合法性校验；失败时直接返回 400，不继续向下执行。
     check_res = check_params(req)
     if check_res is not None:
         return check_res
     
+    # streaming_mode 兼容了旧版布尔值和新版整数枚举两套语义：
+    # 0/False: 非流式，等整段音频生成完再返回
+    # 1/True : 非流式推理，但按片段向客户端逐步回传，兼容旧逻辑
+    # 2      : 真正流式推理，按模型生成节奏持续输出
+    # 3      : 真正流式推理，同时要求输出固定长度 chunk
     if streaming_mode == 0:
         streaming_mode = False
         return_fragment = False
@@ -411,15 +436,20 @@ async def tts_handle(req: dict):
 
     print(f"{streaming_mode} {return_fragment} {fixed_length_chunk}")
 
+    # 只要启用了 return_fragment，本接口对外的返回形式也仍然是“流式响应”。
     streaming_mode = streaming_mode or return_fragment
 
 
     try:
+        # 真正进入 GPT-SoVITS 推理流程。
+        # tts_pipeline.run(req) 返回的是一个生成器，每次迭代产出 (采样率, 音频片段)。
         tts_generator = tts_pipeline.run(req)
 
         if streaming_mode:
 
             def streaming_generator(tts_generator: Generator, media_type: str):
+                # 将模型产出的片段逐个编码并推送给客户端。
+                # 对 wav 而言，第一个 chunk 先补 header，后面的 chunk 切回 raw，避免重复 header。
                 if_frist_chunk = True
                 for sr, chunk in tts_generator:
                     if if_frist_chunk and media_type == "wav":
@@ -438,6 +468,8 @@ async def tts_handle(req: dict):
             )
 
         else:
+            # 非流式模式下，直接取生成器的第一项。
+            # 当前实现默认整段音频会作为一个结果返回。
             sr, audio_data = next(tts_generator)
             audio_data = pack_audio(BytesIO(), audio_data, sr, media_type).getvalue()
             return Response(audio_data, media_type=f"audio/{media_type}")
@@ -447,6 +479,7 @@ async def tts_handle(req: dict):
 
 @APP.get("/control")
 async def control(command: str = None):
+    # 通过 GET 参数接收控制命令。
     if command is None:
         return JSONResponse(status_code=400, content={"message": "command is required"})
     handle_control(command)
@@ -479,6 +512,8 @@ async def tts_get_endpoint(
     overlap_length: int = 2,
     min_chunk_length: int = 16,
 ):
+    # GET 版本的 /tts，主要方便浏览器地址栏或简单脚本直接调试。
+    # 这里将查询参数整理成统一的 req 字典，再交给 tts_handle 处理。
     req = {
         "text": text,
         "text_lang": text_lang.lower(),
@@ -510,12 +545,14 @@ async def tts_get_endpoint(
 
 @APP.post("/tts")
 async def tts_post_endpoint(request: TTS_Request):
+    # POST 版本更适合复杂参数，尤其是 JSON 结构里包含列表时更自然。
     req = request.dict()
     return await tts_handle(req)
 
 
 @APP.get("/set_refer_audio")
 async def set_refer_aduio(refer_audio_path: str = None):
+    # 动态更新默认参考音频，后续推理可复用这份参考音频配置。
     try:
         tts_pipeline.set_ref_audio(refer_audio_path)
     except Exception as e:
@@ -544,6 +581,7 @@ async def set_refer_aduio(refer_audio_path: str = None):
 
 @APP.get("/set_gpt_weights")
 async def set_gpt_weights(weights_path: str = None):
+    # 热切换 GPT 权重，不重启整个服务。
     try:
         if weights_path in ["", None]:
             return JSONResponse(status_code=400, content={"message": "gpt weight path is required"})
@@ -556,6 +594,7 @@ async def set_gpt_weights(weights_path: str = None):
 
 @APP.get("/set_sovits_weights")
 async def set_sovits_weights(weights_path: str = None):
+    # 热切换 SoVITS 权重，不重启整个服务。
     try:
         if weights_path in ["", None]:
             return JSONResponse(status_code=400, content={"message": "sovits weight path is required"})
@@ -567,6 +606,7 @@ async def set_sovits_weights(weights_path: str = None):
 
 if __name__ == "__main__":
     try:
+        # 传入 -a None 时，uvicorn 会监听默认的双栈地址行为。
         if host == "None":  # 在调用时使用 -a None 参数，可以让api监听双栈
             host = None
         uvicorn.run(app=APP, host=host, port=port, workers=1)
